@@ -32,8 +32,9 @@ impl<'a> Visit<'a> for GenMacroVistor {
 
         if is_entry {
             let cur_path = &self.current_mod;
-            let contents = i
-                .block
+            let mut i_cloned = i.clone();
+            i_cloned.attrs = vec![];
+            let contents = i_cloned
                 .to_token_stream()
                 .to_string()
                 .chars()
@@ -178,6 +179,18 @@ impl VisitMut for GenFinalPubVistor {
                     *i = parse_quote!(pub use #cur_path::#e_name;);
                     return;
                 }
+            } else if let syn::Item::Trait(e) = i {
+                if matches!(e.vis, syn::Visibility::Public(_)) {
+                    let e_name = &e.ident;
+                    *i = parse_quote!(pub use #cur_path::#e_name;);
+                    return;
+                }
+            } else if let syn::Item::Impl(e) = i {
+                // TODO(shadaj): emit impls if the struct is private
+                *i = parse_quote!(
+                    #[cfg(feature = "macro")]
+                    #e
+                );
             }
         }
 
@@ -188,6 +201,8 @@ impl VisitMut for GenFinalPubVistor {
         i.items.retain(|i| match i {
             syn::Item::Macro(m) => {
                 m.mac.path.to_token_stream().to_string() != "stageleft :: stageleft_crate"
+                    && m.mac.path.to_token_stream().to_string()
+                        != "stageleft :: stageleft_no_entry_crate"
             }
             _ => true,
         });
@@ -220,6 +235,6 @@ pub fn gen_final_helper(final_crate: &str) {
 #[macro_export]
 macro_rules! gen_final {
     () => {
-        $crate::gen_final_helper(env!("CARGO_CRATE_NAME"))
+        $crate::gen_final_helper(env!("CARGO_PKG_NAME"))
     };
 }

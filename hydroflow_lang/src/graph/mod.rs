@@ -37,7 +37,7 @@ pub use hydroflow_graph::{HydroflowGraph, WriteConfig, WriteGraphType};
 
 pub mod graph_algorithms;
 pub mod ops;
-pub mod propegate_flow_props;
+pub mod propagate_flow_props;
 
 new_key_type! {
     /// ID to identify a node (operator or handoff) in [`HydroflowGraph`].
@@ -84,7 +84,7 @@ struct Varname(#[serde(with = "serde_syn")] pub Ident);
 
 /// A node, corresponding to an operator or a handoff.
 #[derive(Clone, Serialize, Deserialize)]
-pub enum Node {
+pub enum GraphNode {
     /// An operator.
     Operator(#[serde(with = "serde_syn")] Operator),
     /// A handoff point, used between subgraphs (or within a subgraph to break a cycle).
@@ -109,22 +109,22 @@ pub enum Node {
         import_expr: Span,
     },
 }
-impl Node {
+impl GraphNode {
     /// Return the node as a human-readable string.
     pub fn to_pretty_string(&self) -> Cow<'static, str> {
         match self {
-            Node::Operator(op) => op.to_pretty_string().into(),
-            Node::Handoff { .. } => HANDOFF_NODE_STR.into(),
-            Node::ModuleBoundary { .. } => MODULE_BOUNDARY_NODE_STR.into(),
+            GraphNode::Operator(op) => op.to_pretty_string().into(),
+            GraphNode::Handoff { .. } => HANDOFF_NODE_STR.into(),
+            GraphNode::ModuleBoundary { .. } => MODULE_BOUNDARY_NODE_STR.into(),
         }
     }
 
     /// Return the name of the node as a string, excluding parenthesis and op source code.
     pub fn to_name_string(&self) -> Cow<'static, str> {
         match self {
-            Node::Operator(op) => op.name_string().into(),
-            Node::Handoff { .. } => HANDOFF_NODE_STR.into(),
-            Node::ModuleBoundary { .. } => MODULE_BOUNDARY_NODE_STR.into(),
+            GraphNode::Operator(op) => op.name_string().into(),
+            GraphNode::Handoff { .. } => HANDOFF_NODE_STR.into(),
+            GraphNode::ModuleBoundary { .. } => MODULE_BOUNDARY_NODE_STR.into(),
         }
     }
 
@@ -137,7 +137,7 @@ impl Node {
         }
     }
 }
-impl std::fmt::Debug for Node {
+impl std::fmt::Debug for GraphNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Operator(operator) => {
@@ -149,6 +149,15 @@ impl std::fmt::Debug for Node {
             }
         }
     }
+}
+
+/// The type of the Hydroflow graph edge.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GraphEdgeType {
+    /// Standard, pass by value, iterator ownership edges.
+    Value,
+    /// State passed by reference.
+    Reference,
 }
 
 /// Meta-data relating to operators which may be useful throughout the compilation process.
@@ -245,27 +254,6 @@ pub enum Color {
     Comp,
     /// Handoff (grey) -- not a color for operators, inserted between subgraphs.
     Hoff,
-}
-
-/// Determine op color based on in and out degree. If linear (1 in 1 out), color is None.
-///
-/// Note that this does NOT consider `DelayType` barriers, which generally imply `Pull`.
-pub fn node_color(is_handoff: bool, inn_degree: usize, out_degree: usize) -> Option<Color> {
-    if is_handoff {
-        Some(Color::Hoff)
-    } else {
-        match (1 < inn_degree, 1 < out_degree) {
-            (true, true) => Some(Color::Comp),
-            (true, false) => Some(Color::Pull),
-            (false, true) => Some(Color::Push),
-            (false, false) => match (inn_degree, out_degree) {
-                (0, _) => Some(Color::Pull),
-                (_, 0) => Some(Color::Push),
-                // (1, 1) =>
-                _both_unary => None,
-            },
-        }
-    }
 }
 
 /// Helper struct for [`PortIndex`] which keeps span information for elided ports.
@@ -404,9 +392,9 @@ pub fn build_hfcode(
         eliminate_extra_unions_tees(&mut flat_graph);
         match partition_graph(flat_graph) {
             Ok(mut partitioned_graph) => {
-                // Propgeate flow properties throughout the graph.
+                // Propagate flow properties throughout the graph.
                 // TODO(mingwei): Should this be done at a flat graph stage instead?
-                if let Ok(()) = propegate_flow_props::propegate_flow_props(
+                if let Ok(()) = propagate_flow_props::propagate_flow_props(
                     &mut partitioned_graph,
                     &mut diagnostics,
                 ) {

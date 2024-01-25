@@ -1,18 +1,33 @@
+stageleft::stageleft_no_entry_crate!();
+
 use std::marker::PhantomData;
 
 use hydroflow::scheduled::context::Context;
-use hydroflow::scheduled::graph::Hydroflow;
+pub use hydroflow::scheduled::graph::Hydroflow;
 pub use hydroflow::*;
 use proc_macro2::TokenStream;
 use quote::quote;
 use stageleft::runtime_support::FreeVariable;
 use stageleft::Quoted;
 
-mod stream;
-pub use stream::HfStream;
+pub mod runtime_support {
+    pub use bincode;
+}
 
-mod builder;
-pub use builder::HfBuilder;
+pub mod stream;
+pub use stream::Stream;
+
+pub mod location;
+pub use location::{
+    Cluster, ClusterSpec, Deploy, LocalDeploy, Location, MultiGraph, ProcessSpec,
+    SingleProcessGraph,
+};
+
+pub mod cycle;
+pub use cycle::HfCycle;
+
+pub mod builder;
+pub use builder::FlowBuilder;
 
 #[derive(Clone)]
 pub struct RuntimeContext<'a> {

@@ -9,7 +9,7 @@ const katex = require('rehype-katex');
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
-  title: 'Hydro - Build Software for Every Scale',
+  title: 'Hydro - Build for Every Scale',
   tagline: 'Dinosaurs are cool',
   favicon: 'img/favicon.ico',
 
@@ -104,6 +104,9 @@ const config = {
     ({
       // Replace with your project's social card
       image: 'img/social-card.png',
+      colorMode: {
+        respectPrefersColorScheme: true,
+      },
       navbar: {
         title: 'Hydro',
         logo: {
@@ -119,6 +122,11 @@ const config = {
                 type: 'docSidebar',
                 sidebarId: 'hydroflowSidebar',
                 label: 'Hydroflow',
+              },
+              {
+                type: 'docSidebar',
+                sidebarId: 'hydroflowPlusSidebar',
+                label: 'Hydroflow+',
               },
               {
                 type: 'docSidebar',
@@ -159,6 +167,10 @@ const config = {
               {
                 label: 'Hydroflow',
                 to: '/docs/hydroflow/',
+              },
+              {
+                label: 'Hydroflow+',
+                to: '/docs/hydroflow_plus/',
               },
               {
                 label: 'Hydro Deploy',

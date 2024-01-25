@@ -26,7 +26,7 @@ Take a look at the [`lattice` rustdocs](https://hydro-project.github.io/hydroflo
 ## Lattices
 
 `lattices` provides implementations of common lattice types:
-* [`Min<T>`] and [`Max<T>`] - totally-orderd lattices.
+* [`Min<T>`] and [`Max<T>`] - totally-ordered lattices.
 * [`set_union::SetUnion<T>`] - set-union lattice of scalar values.
 * [`map_union::MapUnion<K, Lat>`] - scalar keys with nested lattice values.
 * [`union_find::UnionFind<K>`] - union partitions of a set of scalar values.
@@ -98,3 +98,8 @@ should always return true for all lattice types.
 [`Atomize::atomize`] converts a lattice point into a bunch of smaller lattice points. When these
 "atoms" are merged together they will form the original lattice point. See the docs for more
 precise semantics.
+
+### `DeepReveal`
+
+[`DeepReveal`] allows recursive "revealing" of the underlying data within latties. Particularly
+useful for revealing nested lattices.

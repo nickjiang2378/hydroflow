@@ -14,9 +14,9 @@ use syn::spanned::Spanned;
 use super::graph_write::{Dot, GraphWrite, Mermaid};
 use super::ops::{find_op_op_constraints, OperatorWriteOutput, WriteContextArgs, OPERATORS};
 use super::{
-    get_operator_generics, node_color, Color, DiMulGraph, FlowProps, GraphEdgeId, GraphNodeId,
-    GraphSubgraphId, Node, OperatorInstance, PortIndexValue, Varname, CONTEXT, HANDOFF_NODE_STR,
-    HYDROFLOW,
+    get_operator_generics, Color, DiMulGraph, FlowProps, GraphEdgeId, GraphEdgeType, GraphNode,
+    GraphNodeId, GraphSubgraphId, OperatorInstance, PortIndexValue, Varname, CONTEXT,
+    HANDOFF_NODE_STR, HYDROFLOW,
 };
 use crate::diagnostic::{Diagnostic, Level};
 use crate::graph::ops::null_write_iterator_fn;
@@ -33,8 +33,11 @@ use crate::pretty_span::{PrettyRowCol, PrettySpan};
 /// method then add it.
 #[derive(Default, Debug, Serialize, Deserialize)]
 pub struct HydroflowGraph {
-    /// Each node (operator or handoff).
-    nodes: SlotMap<GraphNodeId, Node>,
+    /// Each node type (operator or handoff).
+    nodes: SlotMap<GraphNodeId, GraphNode>,
+    /// Edge types
+    edge_types: SecondaryMap<GraphEdgeId, GraphEdgeType>,
+
     /// Instance data corresponding to each operator node.
     /// This field will be empty after deserialization.
     #[serde(skip)]
@@ -63,16 +66,19 @@ pub struct HydroflowGraph {
     /// If the value does not exist for a given subgraph id then the subgraph is not lazy.
     subgraph_laziness: SecondaryMap<GraphSubgraphId, bool>,
 }
+
+/// Basic methods.
 impl HydroflowGraph {
     /// Create a new empty `HydroflowGraph`.
     pub fn new() -> Self {
         Default::default()
     }
 }
-// Node methods.
+
+/// Node methods.
 impl HydroflowGraph {
     /// Get a node with its operator instance (if applicable).
-    pub fn node(&self, node_id: GraphNodeId) -> &Node {
+    pub fn node(&self, node_id: GraphNodeId) -> &GraphNode {
         self.nodes.get(node_id).expect("Node not found.")
     }
 
@@ -183,17 +189,17 @@ impl HydroflowGraph {
     }
 
     /// Iterator of node IDs `GraphNodeId`.
-    pub fn node_ids(&self) -> slotmap::basic::Keys<'_, GraphNodeId, Node> {
+    pub fn node_ids(&self) -> slotmap::basic::Keys<'_, GraphNodeId, GraphNode> {
         self.nodes.keys()
     }
 
     /// Iterator over `(GraphNodeId, &Node)` pairs.
-    pub fn nodes(&self) -> slotmap::basic::Iter<'_, GraphNodeId, Node> {
+    pub fn nodes(&self) -> slotmap::basic::Iter<'_, GraphNodeId, GraphNode> {
         self.nodes.iter()
     }
 
     /// Insert a node, assigning the given varname.
-    pub fn insert_node(&mut self, node: Node, varname_opt: Option<Ident>) -> GraphNodeId {
+    pub fn insert_node(&mut self, node: GraphNode, varname_opt: Option<Ident>) -> GraphNodeId {
         let node_id = self.nodes.insert(node);
         if let Some(varname) = varname_opt {
             self.node_varnames.insert(node_id, Varname(varname));
@@ -203,7 +209,10 @@ impl HydroflowGraph {
 
     /// Insert an operator instance for the given node. Panics if already set.
     pub fn insert_node_op_inst(&mut self, node_id: GraphNodeId, op_inst: OperatorInstance) {
-        assert!(matches!(self.nodes.get(node_id), Some(Node::Operator(_))));
+        assert!(matches!(
+            self.nodes.get(node_id),
+            Some(GraphNode::Operator(_))
+        ));
         let old_inst = self.operator_instances.insert(node_id, op_inst);
         assert!(old_inst.is_none());
     }
@@ -212,7 +221,7 @@ impl HydroflowGraph {
     pub fn insert_node_op_insts_all(&mut self, diagnostics: &mut Vec<Diagnostic>) {
         let mut op_insts = Vec::new();
         for (node_id, node) in self.nodes() {
-            let Node::Operator(operator) = node else {
+            let GraphNode::Operator(operator) = node else {
                 continue;
             };
             if self.node_op_inst(node_id).is_some() {
@@ -320,13 +329,13 @@ impl HydroflowGraph {
     pub fn insert_intermediate_node(
         &mut self,
         edge_id: GraphEdgeId,
-        new_node: Node,
+        new_node: GraphNode,
     ) -> (GraphNodeId, GraphEdgeId) {
         let span = Some(new_node.span());
 
         // Make corresponding operator instance (if `node` is an operator).
         let op_inst_opt = 'oc: {
-            let Node::Operator(operator) = &new_node else {
+            let GraphNode::Operator(operator) = &new_node else {
                 break 'oc None;
             };
             let Some(op_constraints) = find_op_op_constraints(operator) else {
@@ -397,6 +406,31 @@ impl HydroflowGraph {
         self.ports.insert(new_edge_id, (src_port, dst_port));
     }
 
+    /// Helper method: determine the "color" (pull vs push) of a node based on its in and out degree,
+    /// excluding reference edges. If linear (1 in, 1 out), color is `None`, indicating it can be
+    /// either push or pull.
+    ///
+    /// Note that this does NOT consider `DelayType` barriers (which generally implies `Pull`).
+    pub(crate) fn node_color(&self, node_id: GraphNodeId) -> Option<Color> {
+        if matches!(self.node(node_id), GraphNode::Handoff { .. }) {
+            return Some(Color::Hoff);
+        }
+        let inn_degree = self.node_degree_in(node_id);
+        let out_degree = self.node_degree_out(node_id);
+        match (inn_degree, out_degree) {
+            (0, 0) => None, // Generally should not happen, "Degenerate subgraph detected".
+            (0, 1) => Some(Color::Pull),
+            (1, 0) => Some(Color::Push),
+            (1, 1) => None, // Linear, can be either push or pull.
+            (_many, 0 | 1) => Some(Color::Pull),
+            (0 | 1, _many) => Some(Color::Push),
+            (_many, _to_many) => Some(Color::Comp),
+        }
+    }
+}
+
+/// Module methods.
+impl HydroflowGraph {
     /// When modules are imported into a flat graph, they come with an input and output ModuleBoundary node.
     /// The partitioner doesn't understand these nodes and will panic if it encounters them.
     /// merge_modules removes them from the graph, stitching the input and ouput sides of the ModuleBondaries based on their ports
@@ -405,98 +439,106 @@ impl HydroflowGraph {
     /// in the above eaxmple, the \[myport\] port will be used to connect the source_iter with the map that is inside of the module.
     /// The output module boundary has elided ports, this is also used to match up the input/output across the module boundary.
     pub fn merge_modules(&mut self) -> Result<(), Diagnostic> {
-        let mut to_remove = Vec::new();
+        let mod_bound_nodes = self
+            .nodes()
+            .filter(|(_nid, node)| matches!(node, GraphNode::ModuleBoundary { .. }))
+            .map(|(nid, _node)| nid)
+            .collect::<Vec<_>>();
 
-        for (nid, node) in self.nodes() {
-            if matches!(node, Node::ModuleBoundary { .. }) {
-                to_remove.push(nid);
-            }
-        }
-
-        for nid in to_remove {
-            self.remove_module_boundary(nid)?;
+        for mod_bound_node in mod_bound_nodes {
+            self.remove_module_boundary(mod_bound_node)?;
         }
 
         Ok(())
     }
 
     /// see `merge_modules`
-    /// This function removes a singular module boundary from the graph and performs the necessary stitching to fix the graph aftward.
+    /// This function removes a singular module boundary from the graph and performs the necessary stitching to fix the graph afterward.
     /// `merge_modules` calls this function for each module boundary in the graph.
-    fn remove_module_boundary(&mut self, nid: GraphNodeId) -> Result<(), Diagnostic> {
+    fn remove_module_boundary(&mut self, mod_bound_node: GraphNodeId) -> Result<(), Diagnostic> {
         assert!(
             self.node_subgraph.is_empty() && self.subgraph_nodes.is_empty(),
             "Should not remove intermediate node after subgraph partitioning"
         );
 
-        let mut predecessor_ports = BTreeMap::new();
-        let mut successor_ports = BTreeMap::new();
+        let mut mod_pred_ports = BTreeMap::new();
+        let mut mod_succ_ports = BTreeMap::new();
 
-        for eid in self.node_predecessor_edges(nid) {
-            let (predecessor_port, successor_port) = self.edge_ports(eid);
-            predecessor_ports.insert(successor_port.clone(), (eid, predecessor_port.clone()));
+        for mod_out_edge in self.node_predecessor_edges(mod_bound_node) {
+            let (pred_port, succ_port) = self.edge_ports(mod_out_edge);
+            mod_pred_ports.insert(succ_port.clone(), (mod_out_edge, pred_port.clone()));
         }
 
-        for eid in self.node_successor_edges(nid) {
-            let (predecessor_port, successor_port) = self.edge_ports(eid);
-            successor_ports.insert(predecessor_port.clone(), (eid, successor_port.clone()));
+        for mod_inn_edge in self.node_successor_edges(mod_bound_node) {
+            let (pred_port, succ_port) = self.edge_ports(mod_inn_edge);
+            mod_succ_ports.insert(pred_port.clone(), (mod_inn_edge, succ_port.clone()));
         }
 
-        if predecessor_ports.keys().collect::<BTreeSet<_>>()
-            != successor_ports.keys().collect::<BTreeSet<_>>()
+        if mod_pred_ports.keys().collect::<BTreeSet<_>>()
+            != mod_succ_ports.keys().collect::<BTreeSet<_>>()
         {
             // get module boundary node
-            match self.node(nid) {
-                Node::ModuleBoundary { input, import_expr } => {
-                    if *input {
-                        return Err(Diagnostic {
-                            span: *import_expr,
-                            level: Level::Error,
-                            message: format!(
-                                "The ports into the module did not match. input: {:?}, expected: {:?}",
-                                predecessor_ports.keys().map(|x| x.to_string()).join(", "),
-                                successor_ports.keys().map(|x| x.to_string()).join(", ")
-                            ),
-                        });
-                    } else {
-                        return Err(Diagnostic {
-                            span: *import_expr,
-                            level: Level::Error,
-                            message: format!("The ports out of the module did not match. output: {:?}, expected: {:?}",
-                                successor_ports.keys().map(|x| x.to_string()).join(", "),
-                                predecessor_ports.keys().map(|x| x.to_string()).join(", "),
-                        )});
-                    }
-                }
-                _ => panic!(),
+            let GraphNode::ModuleBoundary { input, import_expr } = self.node(mod_bound_node) else {
+                panic!();
+            };
+
+            if *input {
+                return Err(Diagnostic {
+                    span: *import_expr,
+                    level: Level::Error,
+                    message: format!(
+                        "The ports into the module did not match. input: {:?}, expected: {:?}",
+                        mod_pred_ports.keys().map(|x| x.to_string()).join(", "),
+                        mod_succ_ports.keys().map(|x| x.to_string()).join(", ")
+                    ),
+                });
+            } else {
+                return Err(Diagnostic {
+                    span: *import_expr,
+                    level: Level::Error,
+                    message: format!(
+                        "The ports out of the module did not match. output: {:?}, expected: {:?}",
+                        mod_succ_ports.keys().map(|x| x.to_string()).join(", "),
+                        mod_pred_ports.keys().map(|x| x.to_string()).join(", "),
+                    ),
+                });
             }
         }
 
-        for (port, (predecessor_edge, predecessor_port)) in predecessor_ports {
-            let (successor_edge, successor_port) = successor_ports.remove(&port).unwrap();
+        for (port, (pred_edge, pred_port)) in mod_pred_ports {
+            let (succ_edge, succ_port) = mod_succ_ports.remove(&port).unwrap();
 
-            let (src, _) = self.graph.remove_edge(predecessor_edge).unwrap();
-            let (_, dst) = self.graph.remove_edge(successor_edge).unwrap();
+            let (src, _) = self.edge(pred_edge);
+            let (_, dst) = self.edge(succ_edge);
+            let edge_type = self.edge_type(pred_edge);
+            self.remove_edge(pred_edge);
+            self.remove_edge(succ_edge);
 
-            self.ports.remove(predecessor_edge);
-            self.ports.remove(successor_edge);
-
-            let eid = self.graph.insert_edge(src, dst);
-            self.ports.insert(eid, (predecessor_port, successor_port));
+            let new_edge_id = self.graph.insert_edge(src, dst);
+            self.ports.insert(new_edge_id, (pred_port, succ_port));
+            if let Some(edge_type) = edge_type {
+                self.edge_types.insert(new_edge_id, edge_type);
+            }
         }
 
-        self.graph.remove_vertex(nid);
-        self.nodes.remove(nid);
+        self.graph.remove_vertex(mod_bound_node);
+        self.nodes.remove(mod_bound_node);
 
         Ok(())
     }
 }
-// Edge methods.
+
+/// Edge methods.
 impl HydroflowGraph {
     /// Get the `src` and `dst` for an edge: `(src GraphNodeId, dst GraphNodeId)`.
     pub fn edge(&self, edge_id: GraphEdgeId) -> (GraphNodeId, GraphNodeId) {
         let (src, dst) = self.graph.edge(edge_id).expect("Edge not found.");
         (src, dst)
+    }
+
+    /// Gets the type of the edge.
+    pub fn edge_type(&self, edge_id: GraphEdgeId) -> Option<GraphEdgeType> {
+        self.edge_types.get(edge_id).copied()
     }
 
     /// Get the source and destination ports for an edge: `(src &PortIndexValue, dst &PortIndexValue)`.
@@ -533,8 +575,25 @@ impl HydroflowGraph {
         self.ports.insert(edge_id, (src_port, dst_port));
         edge_id
     }
+
+    /// Set the edge type for an edge.
+    pub fn insert_edge_type(
+        &mut self,
+        edge: GraphEdgeId,
+        edge_type: GraphEdgeType,
+    ) -> Option<GraphEdgeType> {
+        self.edge_types.insert(edge, edge_type)
+    }
+
+    /// Removes an edge and its corresponding ports and edge type info.
+    pub fn remove_edge(&mut self, edge: GraphEdgeId) {
+        let (_src, _dst) = self.graph.remove_edge(edge).unwrap();
+        let (_src_port, _dst_port) = self.ports.remove(edge).unwrap();
+        let _edge_type = self.edge_types.remove(edge);
+    }
 }
-// Subgraph methods.
+
+/// Subgraph methods.
 impl HydroflowGraph {
     /// Nodes belonging to the given subgraph.
     pub fn subgraph(&self, subgraph_id: GraphSubgraphId) -> &Vec<GraphNodeId> {
@@ -612,8 +671,20 @@ impl HydroflowGraph {
     pub fn max_stratum(&self) -> Option<usize> {
         self.subgraph_stratum.values().copied().max()
     }
+
+    /// Helper: finds the first index in `subgraph_nodes` where it transitions from pull to push.
+    fn find_pull_to_push_idx(&self, subgraph_nodes: &[GraphNodeId]) -> usize {
+        subgraph_nodes
+            .iter()
+            .position(|&node_id| {
+                self.node_color(node_id)
+                    .map_or(false, |color| Color::Pull != color)
+            })
+            .unwrap_or(subgraph_nodes.len())
+    }
 }
-// Flow properties
+
+/// Flow properties
 impl HydroflowGraph {
     /// Gets the flow properties associated with the edge, if set.
     pub fn edge_flow_props(&self, edge_id: GraphEdgeId) -> Option<FlowProps> {
@@ -631,24 +702,25 @@ impl HydroflowGraph {
         self.flow_props.insert(edge_id, flow_props)
     }
 }
-// Display/output stuff.
+
+/// Display/output methods.
 impl HydroflowGraph {
     /// Helper to generate a deterministic `Ident` for the given node.
     fn node_as_ident(&self, node_id: GraphNodeId, is_pred: bool) -> Ident {
         let name = match &self.nodes[node_id] {
-            Node::Operator(_) => format!("op_{:?}", node_id.data()),
-            Node::Handoff { .. } => format!(
+            GraphNode::Operator(_) => format!("op_{:?}", node_id.data()),
+            GraphNode::Handoff { .. } => format!(
                 "hoff_{:?}_{}",
                 node_id.data(),
                 if is_pred { "recv" } else { "send" }
             ),
-            Node::ModuleBoundary { .. } => panic!(),
+            GraphNode::ModuleBoundary { .. } => panic!(),
         };
         let span = match (is_pred, &self.nodes[node_id]) {
-            (_, Node::Operator(operator)) => operator.span(),
-            (true, &Node::Handoff { src_span, .. }) => src_span,
-            (false, &Node::Handoff { dst_span, .. }) => dst_span,
-            (_, Node::ModuleBoundary { .. }) => panic!(),
+            (_, GraphNode::Operator(operator)) => operator.span(),
+            (true, &GraphNode::Handoff { src_span, .. }) => src_span,
+            (false, &GraphNode::Handoff { dst_span, .. }) => dst_span,
+            (_, GraphNode::ModuleBoundary { .. }) => panic!(),
         };
         Ident::new(&*name, span)
     }
@@ -670,7 +742,7 @@ impl HydroflowGraph {
 
         // For each handoff node, add it to the `send`/`recv` lists for the corresponding subgraphs.
         for (hoff_id, node) in self.nodes() {
-            if !matches!(node, Node::Handoff { .. }) {
+            if !matches!(node, GraphNode::Handoff { .. }) {
                 continue;
             }
             // Receivers from the handoff. (Should really only be one).
@@ -703,9 +775,9 @@ impl HydroflowGraph {
             .nodes
             .iter()
             .filter_map(|(node_id, node)| match node {
-                Node::Operator(_) => None,
-                &Node::Handoff { src_span, dst_span } => Some((node_id, (src_span, dst_span))),
-                Node::ModuleBoundary { .. } => panic!(),
+                GraphNode::Operator(_) => None,
+                &GraphNode::Handoff { src_span, dst_span } => Some((node_id, (src_span, dst_span))),
+                GraphNode::ModuleBoundary { .. } => panic!(),
             })
             .map(|(node_id, (src_span, dst_span))| {
                 let ident_send = Ident::new(&*format!("hoff_{:?}_send", node_id.data()), dst_span);
@@ -729,10 +801,13 @@ impl HydroflowGraph {
                     .any(|&node_id| self.node_degree_in(node_id) == 0)
             });
 
-        let subgraphs = subgraphs_without_preds
-            .iter()
-            .chain(subgraphs_with_preds.iter())
-            .filter_map(|&(subgraph_id, subgraph_nodes)| {
+        let mut op_prologue_code = Vec::new();
+        let mut subgraphs = Vec::new();
+        {
+            for &(subgraph_id, subgraph_nodes) in subgraphs_without_preds
+                .iter()
+                .chain(subgraphs_with_preds.iter())
+            {
                 let (recv_hoffs, send_hoffs) = &subgraph_handoffs[subgraph_id];
                 let recv_ports: Vec<Ident> = recv_hoffs
                     .iter()
@@ -743,14 +818,12 @@ impl HydroflowGraph {
                     .map(|&hoff_id| self.node_as_ident(hoff_id, false))
                     .collect();
 
-                let recv_port_code = recv_ports
-                    .iter()
-                    .map(|ident| {
-                        quote! {
-                            let mut #ident = #ident.borrow_mut_swap();
-                            let #ident = #ident.drain(..);
-                        }
-                    });
+                let recv_port_code = recv_ports.iter().map(|ident| {
+                    quote! {
+                        let mut #ident = #ident.borrow_mut_swap();
+                        let #ident = #ident.drain(..);
+                    }
+                });
                 let send_port_code = send_ports.iter().map(|ident| {
                     quote! {
                         let #ident = #root::pusherator::for_each::ForEach::new(|v| {
@@ -759,29 +832,20 @@ impl HydroflowGraph {
                     }
                 });
 
-                let mut op_prologue_code = Vec::new();
                 let mut subgraph_op_iter_code = Vec::new();
                 let mut subgraph_op_iter_after_code = Vec::new();
                 {
-                    let pull_to_push_idx = subgraph_nodes
-                        .iter()
-                        .position(|&node_id| {
-                            node_color(
-                                matches!(self.nodes[node_id], Node::Handoff { .. }),
-                                self.graph.degree_in(node_id),
-                                self.graph.degree_out(node_id),
-                            )
-                            .map(|color| Color::Pull != color)
-                            .unwrap_or(false)
-                        })
-                        .unwrap_or(subgraph_nodes.len());
+                    let pull_to_push_idx = self.find_pull_to_push_idx(subgraph_nodes);
 
                     let (pull_half, push_half) = subgraph_nodes.split_at(pull_to_push_idx);
                     let nodes_iter = pull_half.iter().chain(push_half.iter().rev());
 
                     for (idx, &node_id) in nodes_iter.enumerate() {
                         let node = &self.nodes[node_id];
-                        assert!(matches!(node, Node::Operator(_)), "Handoffs are not part of subgraphs.");
+                        assert!(
+                            matches!(node, GraphNode::Operator(_)),
+                            "Handoffs are not part of subgraphs."
+                        );
                         let op_inst = &self.operator_instances[node_id];
 
                         let op_span = node.span();
@@ -796,10 +860,11 @@ impl HydroflowGraph {
                         {
                             // TODO clean this up.
                             // Collect input arguments (predecessors).
-                            let mut input_edges: Vec<(&PortIndexValue, GraphNodeId)> =
-                                self.graph.predecessors(node_id)
-                                    .map(|(edge_id, pred)| (&self.ports[edge_id].1, pred))
-                                    .collect();
+                            let mut input_edges: Vec<(&PortIndexValue, GraphNodeId)> = self
+                                .graph
+                                .predecessors(node_id)
+                                .map(|(edge_id, pred)| (&self.ports[edge_id].1, pred))
+                                .collect();
                             // Ensure sorted by port index.
                             input_edges.sort();
 
@@ -809,10 +874,11 @@ impl HydroflowGraph {
                                 .collect();
 
                             // Collect output arguments (successors).
-                            let mut output_edges: Vec<(&PortIndexValue, GraphNodeId)> =
-                                self.graph.successors(node_id)
-                                    .map(|(edge_id, succ)| (&self.ports[edge_id].0, succ))
-                                    .collect();
+                            let mut output_edges: Vec<(&PortIndexValue, GraphNodeId)> = self
+                                .graph
+                                .successors(node_id)
+                                .map(|(edge_id, succ)| (&self.ports[edge_id].0, succ))
+                                .collect();
                             // Ensure sorted by port index.
                             output_edges.sort();
 
@@ -822,7 +888,9 @@ impl HydroflowGraph {
                                 .collect();
 
                             // Corresponds 1:1 to inputs.
-                            let flow_props_in = self.graph.predecessor_edges(node_id)
+                            let flow_props_in = self
+                                .graph
+                                .predecessor_edges(node_id)
                                 .map(|edge_id| self.flow_props.get(edge_id).copied())
                                 .collect::<Vec<_>>();
 
@@ -852,7 +920,8 @@ impl HydroflowGraph {
                                 flow_props_in: &*flow_props_in,
                             };
 
-                            let write_result = (op_constraints.write_fn)(&context_args, diagnostics);
+                            let write_result =
+                                (op_constraints.write_fn)(&context_args, diagnostics);
                             let OperatorWriteOutput {
                                 write_prologue,
                                 write_iterator,
@@ -881,7 +950,9 @@ impl HydroflowGraph {
                                     #[cfg(not(feature = "diagnostics"))]
                                     let location = "unknown";
 
-                                    let location = location.to_string().replace(|x: char| !x.is_alphanumeric(), "_");
+                                    let location = location
+                                        .to_string()
+                                        .replace(|x: char| !x.is_alphanumeric(), "_");
 
                                     format!(
                                         "loc_{}_start_{}_{}_end_{}_{}",
@@ -892,7 +963,13 @@ impl HydroflowGraph {
                                         op_span.end().column
                                     )
                                 };
-                                let fn_ident = format_ident!("{}__{}__{}", ident, op_name, source_info, span = op_span);
+                                let fn_ident = format_ident!(
+                                    "{}__{}__{}",
+                                    ident,
+                                    op_name,
+                                    source_info,
+                                    span = op_span
+                                );
                                 let type_guard = if is_pull {
                                     quote_spanned! {op_span=>
                                         let #ident = {
@@ -960,7 +1037,8 @@ impl HydroflowGraph {
                     {
                         // Determine pull and push halves of the `Pivot`.
                         #[allow(unknown_lints)]
-                        #[allow(clippy::redundant_locals)] // https://github.com/rust-lang/rust-clippy/issues/11290
+                        // https://github.com/rust-lang/rust-clippy/issues/11290
+                        #[allow(clippy::redundant_locals)]
                         let pull_to_push_idx = pull_to_push_idx;
                         let pull_ident =
                             self.node_as_ident(subgraph_nodes[pull_to_push_idx - 1], false);
@@ -979,7 +1057,7 @@ impl HydroflowGraph {
                                 Level::Error,
                                 "Degenerate subgraph detected, is there a disconnected `null()` or other degenerate pipeline somewhere?",
                             ));
-                            return None;
+                            continue;
                         };
 
                         // Pivot span is combination of pull and push spans (or if not possible, just take the push).
@@ -1002,9 +1080,7 @@ impl HydroflowGraph {
                     self.subgraph_stratum.get(subgraph_id).cloned().unwrap_or(0),
                 );
                 let laziness = self.subgraph_laziness(subgraph_id);
-                Some(quote! {
-                    #( #op_prologue_code )*
-
+                subgraphs.push(quote! {
                     #hf.add_subgraph_stratified(
                         #hoff_name,
                         #stratum,
@@ -1018,8 +1094,9 @@ impl HydroflowGraph {
                             #( #subgraph_op_iter_after_code )*
                         },
                     );
-                })
-            });
+                });
+            }
+        }
 
         // These two are quoted separately here because iterators are lazily evaluated, so this
         // forces them to do their work. This work includes populating some data, namely
@@ -1027,6 +1104,7 @@ impl HydroflowGraph {
         // -Mingwei
         let code = quote! {
             #( #handoffs )*
+            #( #op_prologue_code )*
             #( #subgraphs )*
         };
 
@@ -1060,36 +1138,17 @@ impl HydroflowGraph {
     /// Color mode (pull vs. push, handoff vs. comp) for nodes. Some nodes can be push *OR* pull;
     /// those nodes will not be set in the returned map.
     pub fn node_color_map(&self) -> SparseSecondaryMap<GraphNodeId, Color> {
-        // TODO(mingwei): this repeated code will be unified when `SerdeGraph` is subsumed into `HydroflowGraph`.
-        // TODO(mingwei): REPEATED CODE, COPIED FROM `flat_to_partitioned.rs`
-
         let mut node_color_map: SparseSecondaryMap<GraphNodeId, Color> = self
-            .nodes
-            .iter()
-            .filter_map(|(node_id, node)| {
-                let inn_degree = self.node_degree_in(node_id);
-                let out_degree = self.node_degree_out(node_id);
-                let is_handoff = matches!(node, Node::Handoff { .. });
-                let op_color = node_color(is_handoff, inn_degree, out_degree);
-                op_color.map(|op_color| (node_id, op_color))
+            .node_ids()
+            .filter_map(|node_id| {
+                let op_color = self.node_color(node_id)?;
+                Some((node_id, op_color))
             })
             .collect();
 
         // Fill in rest via subgraphs.
         for sg_nodes in self.subgraph_nodes.values() {
-            // TODO(mingwei): REPEATED CODE, COPIED FROM `partitioned_graph.rs` codegen.
-            let pull_to_push_idx = sg_nodes
-                .iter()
-                .position(|&node_id| {
-                    let inn_degree = self.node_degree_in(node_id);
-                    let out_degree = self.node_degree_out(node_id);
-                    let node = &self.nodes[node_id];
-                    let is_handoff = matches!(node, Node::Handoff { .. });
-                    node_color(is_handoff, inn_degree, out_degree)
-                        .map(|color| Color::Pull != color)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(sg_nodes.len());
+            let pull_to_push_idx = self.find_pull_to_push_idx(sg_nodes);
 
             for (idx, node_id) in sg_nodes.iter().copied().enumerate() {
                 let is_pull = idx < pull_to_push_idx;
@@ -1199,7 +1258,7 @@ impl HydroflowGraph {
         let mut skipped_handoffs = BTreeSet::new();
         let mut subgraph_handoffs = <BTreeMap<GraphSubgraphId, Vec<GraphNodeId>>>::new();
         for (node_id, node) in self.nodes() {
-            if matches!(node, Node::Handoff { .. }) {
+            if matches!(node, GraphNode::Handoff { .. }) {
                 if write_config.no_handoffs {
                     skipped_handoffs.insert(node_id);
                     continue;
@@ -1305,11 +1364,11 @@ impl HydroflowGraph {
     pub fn write_surface_syntax(&self, write: &mut impl std::fmt::Write) -> std::fmt::Result {
         for (key, node) in self.nodes.iter() {
             match node {
-                Node::Operator(op) => {
+                GraphNode::Operator(op) => {
                     writeln!(write, "{:?} = {};", key.data(), op.to_token_stream())?;
                 }
-                Node::Handoff { .. } => unimplemented!("HANDOFF IN FLAT GRAPH."),
-                Node::ModuleBoundary { .. } => panic!(),
+                GraphNode::Handoff { .. } => unimplemented!("HANDOFF IN FLAT GRAPH."),
+                GraphNode::ModuleBoundary { .. } => panic!(),
             }
         }
         writeln!(write)?;
@@ -1331,7 +1390,7 @@ impl HydroflowGraph {
         writeln!(write, "flowchart TB")?;
         for (key, node) in self.nodes.iter() {
             match node {
-                Node::Operator(operator) => writeln!(
+                GraphNode::Operator(operator) => writeln!(
                     write,
                     "    %% {span}\n    {id:?}[\"{row_col} <tt>{code}</tt>\"]",
                     span = PrettySpan(node.span()),
@@ -1346,10 +1405,10 @@ impl HydroflowGraph {
                         .replace('"', "&quot;")
                         .replace('\n', "<br>"),
                 ),
-                Node::Handoff { .. } => {
+                GraphNode::Handoff { .. } => {
                     writeln!(write, r#"    {:?}{{"{}"}}"#, key.data(), HANDOFF_NODE_STR)
                 }
-                Node::ModuleBoundary { .. } => {
+                GraphNode::ModuleBoundary { .. } => {
                     writeln!(
                         write,
                         r#"    {:?}{{"{}"}}"#,

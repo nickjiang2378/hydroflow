@@ -1,10 +1,23 @@
 #![allow(missing_docs)] // TODO(mingwei)
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 pub use hydroflow_cli_integration::*;
+use serde::de::DeserializeOwned;
 
 use crate::scheduled::graph::Hydroflow;
+
+pub async fn launch<T: DeserializeOwned + Default>(
+    flow: impl FnOnce(&HydroCLI<T>) -> Hydroflow<'_>,
+) {
+    let ports = init_no_ack_start::<T>().await;
+    let flow = flow(&ports);
+
+    println!("ack start");
+
+    launch_flow(flow).await;
+}
 
 pub async fn launch_flow(mut flow: Hydroflow<'_>) {
     let stop = tokio::sync::oneshot::channel();
@@ -15,33 +28,43 @@ pub async fn launch_flow(mut flow: Hydroflow<'_>) {
         stop.0.send(()).unwrap();
     });
 
+    let local_set = tokio::task::LocalSet::new();
+    let flow = local_set.run_until(async move {
+        flow.run_async().await;
+    });
+
     tokio::select! {
         _ = stop.1 => {},
-        _ = flow.run_async() => {}
+        _ = flow => {}
     }
 }
 
-pub struct HydroCLI {
-    ports: HashMap<String, ServerOrBound>,
+pub struct HydroCLI<T = Option<()>> {
+    ports: RefCell<HashMap<String, ServerOrBound>>,
+    pub meta: T,
 }
 
-impl HydroCLI {
-    pub fn port(&mut self, name: &str) -> ServerOrBound {
-        self.ports.remove(name).unwrap()
+impl<T> HydroCLI<T> {
+    pub fn port(&self, name: &str) -> ServerOrBound {
+        self.ports
+            .try_borrow_mut()
+            .unwrap()
+            .remove(name)
+            .unwrap_or_else(|| panic!("port {} not found", name))
     }
 }
 
-pub async fn init() -> HydroCLI {
+async fn init_no_ack_start<T: DeserializeOwned + Default>() -> HydroCLI<T> {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).unwrap();
     let trimmed = input.trim();
 
-    let bind_config = serde_json::from_str::<HashMap<String, ServerBindConfig>>(trimmed).unwrap();
+    let bind_config = serde_json::from_str::<InitConfig>(trimmed).unwrap();
 
     // config telling other services how to connect to me
     let mut bind_results: HashMap<String, ServerPort> = HashMap::new();
     let mut binds = HashMap::new();
-    for (name, config) in bind_config {
+    for (name, config) in bind_config.0 {
         let bound = config.bind().await;
         bind_results.insert(name.clone(), bound.sink_port());
         binds.insert(name.clone(), bound);
@@ -71,6 +94,18 @@ pub async fn init() -> HydroCLI {
     }
 
     HydroCLI {
-        ports: all_connected,
+        ports: RefCell::new(all_connected),
+        meta: bind_config
+            .1
+            .map(|b| serde_json::from_str(&b).unwrap())
+            .unwrap_or_default(),
     }
+}
+
+pub async fn init<T: DeserializeOwned + Default>() -> HydroCLI<T> {
+    let ret = init_no_ack_start::<T>().await;
+
+    println!("ack start");
+
+    ret
 }

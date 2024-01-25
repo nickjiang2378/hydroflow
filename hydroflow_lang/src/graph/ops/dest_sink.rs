@@ -1,9 +1,10 @@
 use quote::quote_spanned;
 
 use super::{
-    OperatorCategory, OperatorConstraints, OperatorInstance,
-    OperatorWriteOutput, WriteContextArgs, RANGE_0, RANGE_1,
+    OperatorCategory, OperatorConstraints, OperatorInstance, OperatorWriteOutput, WriteContextArgs,
+    RANGE_0, RANGE_1,
 };
+use crate::graph::GraphEdgeType;
 
 /// > Arguments: An [async `Sink`](https://docs.rs/futures/latest/futures/sink/trait.Sink.html).
 ///
@@ -11,7 +12,7 @@ use super::{
 /// A `Sink` is a thing into which values can be sent, asynchronously. For example, sending items
 /// into a bounded channel.
 ///
-/// Note this operator must be used within a Tokio runtime.
+/// Note this operator must be used within a Tokio runtime, and the Hydroflow program must be launched with `run_async`.
 ///
 /// ```rustbook
 /// # #[hydroflow::main]
@@ -28,7 +29,7 @@ use super::{
 /// let mut flow = hydroflow::hydroflow_syntax! {
 ///     source_iter(0..10) -> dest_sink(send);
 /// };
-/// // Call `run_async()` to allow async events to propegate, run for one second.
+/// // Call `run_async()` to allow async events to propagate, run for one second.
 /// tokio::time::timeout(std::time::Duration::from_secs(1), flow.run_async())
 ///     .await
 ///     .expect_err("Expected time out");
@@ -95,6 +96,8 @@ pub const DEST_SINK: OperatorConstraints = OperatorConstraints {
     ports_inn: None,
     ports_out: None,
     input_delaytype_fn: |_| None,
+    input_edgetype_fn: |_| Some(GraphEdgeType::Value),
+    output_edgetype_fn: |_| GraphEdgeType::Value,
     flow_prop_fn: None,
     write_fn: |wc @ &WriteContextArgs {
                    root,
@@ -139,7 +142,7 @@ pub const DEST_SINK: OperatorConstraints = OperatorConstraints {
                     }
                 }
                 #hydroflow
-                    .spawn_task(sink_feed_flush(#recv_ident, #sink_arg));
+                    .request_task(sink_feed_flush(#recv_ident, #sink_arg));
             }
         };
 

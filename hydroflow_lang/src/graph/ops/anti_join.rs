@@ -2,19 +2,20 @@ use quote::{quote_spanned, ToTokens};
 use syn::parse_quote;
 
 use super::{
-    DelayType, OperatorCategory, OperatorConstraints,
-    OperatorWriteOutput, Persistence, WriteContextArgs, RANGE_0, RANGE_1,
+    DelayType, OperatorCategory, OperatorConstraints, OperatorWriteOutput, Persistence,
+    WriteContextArgs, RANGE_0, RANGE_1,
 };
 use crate::diagnostic::{Diagnostic, Level};
-use crate::graph::{OpInstGenerics, OperatorInstance, PortIndexValue};
+use crate::graph::{GraphEdgeType, OpInstGenerics, OperatorInstance, PortIndexValue};
 
 /// > 2 input streams the first of type (K, T), the second of type K,
 /// > with output type (K, T)
 ///
 /// For a given tick, computes the anti-join of the items in the input
 /// streams, returning unique items in the `pos` input that do not have matching keys
-/// in the `neg` input. Note this is set semantics, so duplicate items in the `pos` input
-/// are output 0 or 1 times (if they do/do-not have a match in `neg` respectively.)
+/// in the `neg` input. Note this is set semantics only for the `neg element`. Order
+/// is preserved for new elements in a given tick, but not for elements processed
+/// in a previous tick with `'static`.
 ///
 /// ```hydroflow
 /// source_iter(vec![("dog", 1), ("cat", 2), ("elephant", 3)]) -> [pos]diff;
@@ -40,6 +41,8 @@ pub const ANTI_JOIN: OperatorConstraints = OperatorConstraints {
         }
         _else => None,
     },
+    input_edgetype_fn: |_| Some(GraphEdgeType::Value),
+    output_edgetype_fn: |_| GraphEdgeType::Value,
     flow_prop_fn: None,
     write_fn: |wc @ &WriteContextArgs {
                    root,

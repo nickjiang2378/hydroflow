@@ -2,10 +2,10 @@ use quote::{quote_spanned, ToTokens};
 use syn::parse_quote;
 
 use super::{
-    DelayType, OperatorCategory, OperatorConstraints,
-    OperatorWriteOutput, WriteContextArgs, RANGE_0, RANGE_1,
+    DelayType, OperatorCategory, OperatorConstraints, OperatorWriteOutput, WriteContextArgs,
+    RANGE_0, RANGE_1,
 };
-use crate::graph::{OperatorInstance, PortIndexValue};
+use crate::graph::{GraphEdgeType, OperatorInstance, PortIndexValue};
 
 /// > 2 input streams of the same type T, 1 output stream of type T
 ///
@@ -16,8 +16,7 @@ use crate::graph::{OperatorInstance, PortIndexValue};
 /// `difference` can be provided with one or two generic lifetime persistence arguments
 /// in the same way as [`join`](#join), see [`join`'s documentation](#join) for more info.
 ///
-/// Note set semantics here: duplicate items in the `pos` input
-/// are output 0 or 1 times (if they do/do-not have a match in `neg` respectively.)
+/// Note set semantics only for the `neg` input.
 ///
 /// ```hydroflow
 /// source_iter(vec!["dog", "cat", "elephant"]) -> [pos]diff;
@@ -43,6 +42,8 @@ pub const DIFFERENCE: OperatorConstraints = OperatorConstraints {
         }
         _else => None,
     },
+    input_edgetype_fn: |_| Some(GraphEdgeType::Value),
+    output_edgetype_fn: |_| GraphEdgeType::Value,
     flow_prop_fn: None,
     write_fn: |wc @ &WriteContextArgs {
                    op_span,

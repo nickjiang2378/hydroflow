@@ -115,7 +115,10 @@ impl<'ast> Visit<'ast> for FreeVariableVisitor {
             syn::Pat::Ident(pat_ident) => {
                 self.current_scope.insert_term(pat_ident.ident.clone());
             }
-            _ => panic!("Local variables must be identifiers"),
+            syn::Pat::Type(pat_type) => {
+                self.visit_pat(&pat_type.pat);
+            }
+            _ => panic!("Local variables must be identifiers, got {:?}", i.pat),
         }
     }
 
@@ -163,6 +166,9 @@ impl<'ast> Visit<'ast> for FreeVariableVisitor {
 
     fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
         syn::visit::visit_expr(self, &i.receiver);
+        for arg in &i.args {
+            self.visit_expr(arg);
+        }
     }
 
     fn visit_type(&mut self, _: &'ast syn::Type) {}

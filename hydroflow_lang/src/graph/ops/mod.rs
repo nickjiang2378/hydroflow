@@ -13,8 +13,8 @@ use syn::punctuated::Punctuated;
 use syn::{parse_quote_spanned, Expr, Token};
 
 use super::{
-    FlowProps, GraphNodeId, GraphSubgraphId, LatticeFlowType, Node, OpInstGenerics,
-    OperatorInstance, PortIndexValue,
+    FlowProps, GraphEdgeType, GraphNode, GraphNodeId, GraphSubgraphId, LatticeFlowType,
+    OpInstGenerics, OperatorInstance, PortIndexValue,
 };
 use crate::diagnostic::{Diagnostic, Level};
 use crate::parse::{Operator, PortIndex};
@@ -22,11 +22,13 @@ use crate::parse::{Operator, PortIndex};
 /// The delay (soft barrier) type, for each input to an operator if needed.
 #[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 pub enum DelayType {
-    /// Input should be collected over the preceeding stratum.
+    /// Input must be collected over the preceeding stratum.
     Stratum,
-    /// Input should be collected over the previous tick.
+    /// Monotone accumulation: can delay to reduce flow rate, but also correct to emit "early"
+    MonotoneAccum,
+    /// Input must be collected over the previous tick.
     Tick,
-    /// Input should be collected over the previous tick but also not cause a new tick to occur.
+    /// Input must be collected over the previous tick but also not cause a new tick to occur.
     TickLazy,
 }
 
@@ -73,6 +75,10 @@ pub struct OperatorConstraints {
 
     /// Determines if this input must be preceeded by a stratum barrier.
     pub input_delaytype_fn: fn(&PortIndexValue) -> Option<DelayType>,
+    /// The required edge type for each input. `None` means any is OK.
+    pub input_edgetype_fn: fn(&PortIndexValue) -> Option<GraphEdgeType>,
+    /// Specifies the edge type for each output port.
+    pub output_edgetype_fn: fn(&PortIndexValue) -> GraphEdgeType,
 
     /// Return the output flow types for the given input flow types.
     ///
@@ -400,6 +406,7 @@ declare_ops![
     source_stdin::SOURCE_STDIN,
     source_stream::SOURCE_STREAM,
     source_stream_serde::SOURCE_STREAM_SERDE,
+    state::STATE,
     tee::TEE,
     unique::UNIQUE,
     unzip::UNZIP,
@@ -413,9 +420,9 @@ pub fn operator_lookup() -> &'static HashMap<&'static str, &'static OperatorCons
         OnceLock::new();
     OPERATOR_LOOKUP.get_or_init(|| OPERATORS.iter().map(|op| (op.name, op)).collect())
 }
-/// Find an operator by [`Node`].
-pub fn find_node_op_constraints(node: &Node) -> Option<&'static OperatorConstraints> {
-    if let Node::Operator(operator) = node {
+/// Find an operator by [`GraphNode`].
+pub fn find_node_op_constraints(node: &GraphNode) -> Option<&'static OperatorConstraints> {
+    if let GraphNode::Operator(operator) = node {
         find_op_op_constraints(operator)
     } else {
         None
