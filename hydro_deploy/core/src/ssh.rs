@@ -255,13 +255,10 @@ impl<T: LaunchedSSHHost> LaunchedHost for T {
     }
 
     async fn forward_port(&self, addr: &SocketAddr) -> Result<SocketAddr> {
-        ProgressTracker::println("Forwarding port");
         let session = self.open_ssh_session().await?;
 
-        ProgressTracker::println("[forward_port]: binding to tcp listener localhost");
         let local_port = TcpListener::bind("127.0.0.1:0").await?;
         let local_addr = local_port.local_addr()?;
-        ProgressTracker::println("[forward_port]: bound to localhost");
 
         let internal_ip = addr.ip().to_string();
         let port = addr.port();
