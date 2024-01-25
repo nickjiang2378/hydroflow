@@ -100,8 +100,6 @@ impl LaunchedSSHHost for LaunchedComputeEngine {
                 &|| async {
                     let mut config = SessionConfiguration::new();
                     config.set_compress(true);
-                    ProgressTracker::println("Starting session");
-
 
                     let mut session =
                         AsyncSession::<TcpStream>::connect(target_addr, Some(config)).await?;

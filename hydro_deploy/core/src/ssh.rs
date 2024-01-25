@@ -172,7 +172,6 @@ impl<T: LaunchedSSHHost> LaunchedHost for T {
             .await?;
         }
         drop(sftp);
-        ProgressTracker::println("[launch_binary] uploaded binary");
 
         Ok(())
     }
@@ -219,7 +218,6 @@ impl<T: LaunchedSSHHost> LaunchedHost for T {
             },
         )
         .await?;
-        ProgressTracker::println("[launch_binary] launched binary");
 
         let (stdin_sender, mut stdin_receiver) = async_channel::unbounded::<String>();
         let mut stdin = channel.stream(0); // stream 0 is stdout/stdin, we use it for stdin
