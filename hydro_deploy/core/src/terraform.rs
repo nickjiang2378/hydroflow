@@ -79,6 +79,7 @@ impl Drop for TerraformPool {
 #[derive(Serialize, Deserialize)]
 pub struct TerraformBatch {
     pub terraform: TerraformConfig,
+    pub provider: HashMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub data: HashMap<String, HashMap<String, serde_json::Value>>,
     pub resource: HashMap<String, HashMap<String, serde_json::Value>>,
@@ -91,6 +92,7 @@ impl Default for TerraformBatch {
             terraform: TerraformConfig {
                 required_providers: HashMap::new(),
             },
+            provider: HashMap::new(),
             data: HashMap::new(),
             resource: HashMap::new(),
             output: HashMap::new(),
@@ -120,6 +122,13 @@ impl TerraformBatch {
             let dothydro_folder = std::env::current_dir().unwrap().join(".hydro");
             std::fs::create_dir_all(&dothydro_folder).unwrap();
             let deployment_folder = tempfile::tempdir_in(dothydro_folder).unwrap();
+
+            // ProgressTracker::println(&serde_json::to_string(&self).unwrap());
+
+            // std::fs::write(
+            //     "./temp.json",
+            //     serde_json::to_string(&self).unwrap(),
+            // ).unwrap();
 
             std::fs::write(
                 deployment_folder.path().join("main.tf.json"),

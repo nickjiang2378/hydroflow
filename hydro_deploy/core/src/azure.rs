@@ -11,7 +11,6 @@ use hydroflow_cli_integration::ServerBindConfig;
 use nanoid::nanoid;
 use serde_json::json;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
 
 use super::progress::ProgressTracker;
 use super::ssh::LaunchedSSHHost;
@@ -86,51 +85,41 @@ impl LaunchedSSHHost for LaunchedComputeEngine {
         let target_addr = SocketAddr::new(
             self.external_ip
                 .as_ref()
-                .context("GCP host must be configured with an external IP to launch binaries")?
+                .context("Azure host must be configured with an external IP to launch binaries")?
                 .parse()
                 .unwrap(),
             22,
         );
 
-        let mut attempt_count = 0;
+        let res = ProgressTracker::leaf(
+            format!(
+                "connecting to host @ {}",
+                self.external_ip.as_ref().unwrap()
+            ),
+            async_retry(
+                &|| async {
+                    let mut config = SessionConfiguration::new();
+                    config.set_compress(true);
 
-        let res = async_retry(
-            || {
-                attempt_count += 1;
-                ProgressTracker::leaf(
-                    format!(
-                        "connecting to host @ {} (attempt: {})",
-                        self.external_ip.as_ref().unwrap(),
-                        attempt_count
-                    ),
-                    async {
-                        let mut config = SessionConfiguration::new();
-                        config.set_compress(true);
+                    let mut session =
+                        AsyncSession::<TcpStream>::connect(target_addr, Some(config)).await?;
 
-                        tokio::time::timeout(Duration::from_secs(15), async move {
-                            let mut session =
-                                AsyncSession::<TcpStream>::connect(target_addr, Some(config))
-                                    .await?;
+                    session.handshake().await?;
 
-                            session.handshake().await?;
+                    session
+                        .userauth_pubkey_file(
+                            self.user.as_str(),
+                            None,
+                            self.ssh_key_path().as_path(),
+                            None,
+                        )
+                        .await?;
 
-                            session
-                                .userauth_pubkey_file(
-                                    self.user.as_str(),
-                                    None,
-                                    self.ssh_key_path().as_path(),
-                                    None,
-                                )
-                                .await?;
-
-                            Ok(session)
-                        })
-                        .await?
-                    },
-                )
-            },
-            10,
-            Duration::from_secs(1),
+                    Ok(session)
+                },
+                10,
+                Duration::from_secs(1),
+            ),
         )
         .await?;
 
@@ -138,159 +127,35 @@ impl LaunchedSSHHost for LaunchedComputeEngine {
     }
 }
 
-#[derive(Debug)]
-pub struct GCPNetwork {
-    pub project: String,
-    pub existing_vpc: Option<String>,
-    id: String,
-}
-
-impl GCPNetwork {
-    pub fn new(project: impl Into<String>, existing_vpc: Option<String>) -> Self {
-        Self {
-            project: project.into(),
-            existing_vpc,
-            id: nanoid!(8, &TERRAFORM_ALPHABET),
-        }
-    }
-
-    fn collect_resources(&mut self, resource_batch: &mut ResourceBatch) -> String {
-        resource_batch
-            .terraform
-            .terraform
-            .required_providers
-            .insert(
-                "google".to_string(),
-                TerraformProvider {
-                    source: "hashicorp/google".to_string(),
-                    version: "4.53.1".to_string(),
-                },
-            );
-
-        let vpc_network = format!("hydro-vpc-network-{}", self.id);
-
-        if let Some(existing) = self.existing_vpc.as_ref() {
-            if resource_batch
-                .terraform
-                .resource
-                .get(&"google_compute_network".to_string())
-                .unwrap_or(&HashMap::new())
-                .contains_key(existing)
-            {
-                format!("google_compute_network.{existing}")
-            } else {
-                resource_batch
-                    .terraform
-                    .data
-                    .entry("google_compute_network".to_string())
-                    .or_default()
-                    .insert(
-                        vpc_network.clone(),
-                        json!({
-                            "name": existing,
-                            "project": self.project,
-                        }),
-                    );
-
-                format!("data.google_compute_network.{vpc_network}")
-            }
-        } else {
-            resource_batch
-                .terraform
-                .resource
-                .entry("google_compute_network".to_string())
-                .or_default()
-                .insert(
-                    vpc_network.clone(),
-                    json!({
-                        "name": vpc_network,
-                        "project": self.project,
-                        "auto_create_subnetworks": true
-                    }),
-                );
-
-            let firewall_entries = resource_batch
-                .terraform
-                .resource
-                .entry("google_compute_firewall".to_string())
-                .or_default();
-
-            // allow all VMs to communicate with each other over internal IPs
-            firewall_entries.insert(
-                format!("{vpc_network}-default-allow-internal"),
-                json!({
-                    "name": format!("{vpc_network}-default-allow-internal"),
-                    "project": self.project,
-                    "network": format!("${{google_compute_network.{vpc_network}.name}}"),
-                    "source_ranges": ["10.128.0.0/9"],
-                    "allow": [
-                        {
-                            "protocol": "tcp",
-                            "ports": ["0-65535"]
-                        },
-                        {
-                            "protocol": "udp",
-                            "ports": ["0-65535"]
-                        },
-                        {
-                            "protocol": "icmp"
-                        }
-                    ]
-                }),
-            );
-
-            // allow external pings to all VMs
-            firewall_entries.insert(
-                format!("{vpc_network}-default-allow-ping"),
-                json!({
-                    "name": format!("{vpc_network}-default-allow-ping"),
-                    "project": self.project,
-                    "network": format!("${{google_compute_network.{vpc_network}.name}}"),
-                    "source_ranges": ["0.0.0.0/0"],
-                    "allow": [
-                        {
-                            "protocol": "icmp"
-                        }
-                    ]
-                }),
-            );
-
-            self.existing_vpc = Some(vpc_network.clone());
-
-            format!("google_compute_network.{vpc_network}")
-        }
-    }
-}
-
-pub struct GCPComputeEngineHost {
+pub struct AzureHost {
     pub id: usize,
     pub project: String,
-    pub machine_type: String,
+    pub os_type: String, // linux or windows
+    pub machine_size: String,
     pub image: String,
     pub region: String,
-    pub network: Arc<RwLock<GCPNetwork>>,
     pub user: Option<String>,
     pub launched: Option<Arc<LaunchedComputeEngine>>,
     external_ports: Vec<u16>,
 }
 
-impl GCPComputeEngineHost {
+impl AzureHost {
     pub fn new(
         id: usize,
-        project: impl Into<String>,
-        machine_type: impl Into<String>,
-        image: impl Into<String>,
-        region: impl Into<String>,
-        network: Arc<RwLock<GCPNetwork>>,
+        project: String,
+        os_type: String, // linux or windows
+        machine_size: String,
+        image: String,
+        region: String,
         user: Option<String>,
     ) -> Self {
         Self {
             id,
-            project: project.into(),
-            machine_type: machine_type.into(),
-            image: image.into(),
-            region: region.into(),
-            network,
+            project,
+            os_type,
+            machine_size,
+            image,
+            region,
             user,
             launched: None,
             external_ports: vec![],
@@ -299,7 +164,7 @@ impl GCPComputeEngineHost {
 }
 
 #[async_trait]
-impl Host for GCPComputeEngineHost {
+impl Host for AzureHost {
     fn target_type(&self) -> HostTargetType {
         HostTargetType::Linux
     }
@@ -355,26 +220,20 @@ impl Host for GCPComputeEngineHost {
             return;
         }
 
-        let vpc_path = self
-            .network
-            .try_write()
-            .unwrap()
-            .collect_resources(resource_batch);
-
         let project = self.project.as_str();
 
         // first, we import the providers we need
         resource_batch
-            .terraform
-            .terraform
-            .required_providers
-            .insert(
-                "google".to_string(),
-                TerraformProvider {
-                    source: "hashicorp/google".to_string(),
-                    version: "4.53.1".to_string(),
-                },
-            );
+        .terraform
+        .terraform
+        .required_providers
+        .insert(
+            "azurerm".to_string(),
+            TerraformProvider {
+                source: "hashicorp/azurerm".to_string(),
+                version: "3.67.0".to_string(),
+            },
+        );
 
         resource_batch
             .terraform
@@ -428,100 +287,202 @@ impl Host for GCPComputeEngineHost {
                 }),
             );
 
+
         let vm_key = format!("vm-instance-{}", self.id);
         let vm_name = format!("hydro-vm-instance-{}", nanoid!(8, &TERRAFORM_ALPHABET));
 
-        let mut tags = vec![];
-        let mut external_interfaces = vec![];
-
-        if self.external_ports.is_empty() {
-            external_interfaces.push(json!({ "network": format!("${{{vpc_path}.self_link}}") }));
-        } else {
-            external_interfaces.push(json!({
-                "network": format!("${{{vpc_path}.self_link}}"),
-                "access_config": [
-                    {
-                        "network_tier": "STANDARD"
-                    }
-                ]
-            }));
-
-            // open the external ports that were requested
-            let my_external_tags = self.external_ports.iter().map(|port| {
-                let rule_id = nanoid!(8, &TERRAFORM_ALPHABET);
-                let firewall_rule = resource_batch
-                    .terraform
-                    .resource
-                    .entry("google_compute_firewall".to_string())
-                    .or_default()
-                    .entry(format!("open-external-port-{}", port))
-                    .or_insert(json!({
-                        "name": format!("open-external-port-{}-{}", port, rule_id),
-                        "project": project,
-                        "network": format!("${{{vpc_path}.name}}"),
-                        "target_tags": [format!("open-external-port-tag-{}-{}", port, rule_id)],
-                        "source_ranges": ["0.0.0.0/0"],
-                        "allow": [
-                            {
-                                "protocol": "tcp",
-                                "ports": vec![port.to_string()]
-                            }
-                        ]
-                    }));
-
-                firewall_rule["target_tags"].as_array().unwrap()[0].clone()
-            });
-
-            tags.extend(my_external_tags);
-
-            resource_batch.terraform.output.insert(
-                format!("{vm_key}-public-ip"),
-                TerraformOutput {
-                    value: format!("${{google_compute_instance.{vm_key}.network_interface[0].access_config[0].nat_ip}}")
-                }
+        // Handle provider configuration
+        resource_batch
+            .terraform
+            .provider
+            .insert(
+                "azurerm".to_string(),
+                json!({
+                    "skip_provider_registration": "true",
+                    "features": {},
+                })
             );
-        }
 
-        let user = self.user.as_ref().cloned().unwrap_or("hydro".to_string());
+        // Handle resources
         resource_batch
             .terraform
             .resource
-            .entry("google_compute_instance".to_string())
+            .entry("azurerm_resource_group".to_string())
+            .or_default()
+            .insert(
+                "example".to_string(),
+                json!({
+                    "name": project,
+                    "location": self.region.clone(),
+                })
+            );
+
+        resource_batch
+            .terraform
+            .resource
+            .entry("azurerm_virtual_network".to_string())
+            .or_default()
+            .insert(
+                "example".to_string(),
+                json!({
+                    "name": "example-network",
+                    "address_space": ["10.0.0.0/16"],
+                    "location": self.region.clone(),
+                    "resource_group_name": "${azurerm_resource_group.example.name}"
+                })
+            );
+
+        resource_batch
+            .terraform
+            .resource
+            .entry("azurerm_subnet".to_string())
+            .or_default()
+            .insert(
+                "example".to_string(),
+                json!({
+                    "name": "internal",
+                    "resource_group_name": "${azurerm_resource_group.example.name}",
+                    "virtual_network_name": "${azurerm_virtual_network.example.name}",
+                    "address_prefixes": ["10.0.2.0/24"]
+                })
+            );
+
+        resource_batch
+            .terraform
+            .resource
+            .entry("azurerm_public_ip".to_string())
+            .or_default()
+            .insert(
+                "example".to_string(),
+                json!({
+                    "name": "hydropubip",
+                    "resource_group_name": "${azurerm_resource_group.example.name}",
+                    "location": "${azurerm_resource_group.example.location}",
+                    "allocation_method": "Static",
+                })
+            );
+
+        resource_batch
+            .terraform
+            .resource
+            .entry("azurerm_network_interface".to_string())
+            .or_default()
+            .insert(
+                "example".to_string(),
+                json!({
+                    "name": "example-nic",
+                    "location": "${azurerm_resource_group.example.location}",
+                    "resource_group_name": "${azurerm_resource_group.example.name}",
+                    "ip_configuration": {
+                        "name": "internal",
+                        "subnet_id": "${azurerm_subnet.example.id}",
+                        "private_ip_address_allocation": "Dynamic",
+                        "public_ip_address_id": "${azurerm_public_ip.example.id}",
+                    }
+                })
+            );
+
+        // Define network security rules - for now, accept all connections
+        resource_batch
+            .terraform
+            .resource
+            .entry("azurerm_network_security_group".to_string())
+            .or_default()
+            .insert(
+                "example".to_string(),
+                json!({
+                    "name": "acceptanceTestSecurityGroup1",
+                    "location": "${azurerm_resource_group.example.location}",
+                    "resource_group_name": "${azurerm_resource_group.example.name}",
+                })
+            );
+
+        resource_batch
+            .terraform
+            .resource
+            .entry("azurerm_network_security_rule".to_string())
+            .or_default()
+            .insert(
+                "example".to_string(),
+                json!({
+                    "name": "allowall",
+                    "priority": 100,
+                    "direction": "Inbound",
+                    "access": "Allow",
+                    "protocol": "Tcp",
+                    "source_port_range": "*",
+                    "destination_port_range": "*",
+                    "source_address_prefix": "*",
+                    "destination_address_prefix": "*",
+                    "resource_group_name": "${azurerm_resource_group.example.name}",
+                    "network_security_group_name": "${azurerm_network_security_group.example.name}",
+                })
+            );
+
+        resource_batch
+            .terraform
+            .resource
+            .entry("azurerm_subnet_network_security_group_association".to_string())
+            .or_default()
+            .insert(
+                "example".to_string(),
+                json!({
+                    "subnet_id": "${azurerm_subnet.example.id}",
+                    "network_security_group_id": "${azurerm_network_security_group.example.id}",
+                })
+            );
+
+
+        let user = self.user.as_ref().cloned().unwrap_or("hydro".to_string());
+        let os_type = format!("azurerm_{}_virtual_machine", self.os_type.clone());
+        resource_batch
+            .terraform
+            .resource
+            .entry(os_type.clone())
             .or_default()
             .insert(
                 vm_key.clone(),
                 json!({
-                    "name": vm_name,
-                    "project": project,
-                    "machine_type": self.machine_type,
-                    "zone": self.region,
-                    "tags": tags,
-                    "metadata": {
-                        "ssh-keys": format!("{user}:${{tls_private_key.vm_instance_ssh_key.public_key_openssh}}")
+                    "name": "example-machine",
+                    "resource_group_name": "${azurerm_resource_group.example.name}",
+                    "location": "${azurerm_resource_group.example.location}",
+                    "size": self.machine_size.clone(),
+                    "network_interface_ids": ["${azurerm_network_interface.example.id}"],
+                    "admin_ssh_key": {
+                        "username": user,
+                        "public_key": "${tls_private_key.vm_instance_ssh_key.public_key_openssh}",
                     },
-                    "boot_disk": [
-                        {
-                            "initialize_params": [
-                                {
-                                    "image": self.image
-                                }
-                            ]
-                        }
-                    ],
-                    "network_interface": external_interfaces
+                    "admin_username": user,
+                    "os_disk": {
+                        "caching": "ReadWrite",
+                        "storage_account_type": "Standard_LRS",
+                    },
+                    "source_image_reference": {
+                        "publisher": "Canonical",
+                        "offer": "0001-com-ubuntu-server-jammy",
+                        "sku": "22_04-lts",
+                        "version": "latest",
+                    }
                 }),
             );
+
+        resource_batch.terraform.output.insert(
+            format!("{vm_key}-public-ip"),
+            TerraformOutput {
+                value: format!(
+                    "${{azurerm_public_ip.example.ip_address}}"
+                ),
+            },
+        );
 
         resource_batch.terraform.output.insert(
             format!("{vm_key}-internal-ip"),
             TerraformOutput {
                 value: format!(
-                    "${{google_compute_instance.{vm_key}.network_interface[0].network_ip}}"
+                    "${{azurerm_network_interface.example.private_ip_address}}"
                 ),
             },
         );
-
-        print!("{:?}", resource_batch.terraform.resource);
     }
 
     fn launched(&self) -> Option<Arc<dyn LaunchedHost>> {
@@ -580,14 +541,14 @@ impl Host for GCPComputeEngineHost {
             Ok((
                 ClientStrategy::ForwardedTcpPort(self),
                 Box::new(|me| {
-                    me.downcast_mut::<GCPComputeEngineHost>()
+                    me.downcast_mut::<AzureHost>()
                         .unwrap()
                         .request_port(&ServerStrategy::ExternalTcpPort(22)); // needed to forward
                     ServerStrategy::InternalTcpPort
                 }),
             ))
         } else {
-            anyhow::bail!("Could not find a strategy to connect to GCP instance")
+            anyhow::bail!("Could not find a strategy to connect to Azure instance")
         }
     }
 
@@ -606,10 +567,10 @@ impl Host for GCPComputeEngineHost {
                 }
             }
             ClientStrategy::InternalTcpPort(target_host) => {
-                if let Some(gcp_target) =
-                    target_host.as_any().downcast_ref::<GCPComputeEngineHost>()
+                if let Some(provider_target) =
+                    target_host.as_any().downcast_ref::<AzureHost>()
                 {
-                    self.project == gcp_target.project
+                    self.project == provider_target.project
                 } else {
                     false
                 }

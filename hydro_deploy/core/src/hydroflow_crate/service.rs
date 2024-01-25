@@ -298,12 +298,14 @@ impl Service for HydroflowCrateService {
                     .await
                     .send(format!("{formatted_bind_config}\n"))
                     .await?;
+                ProgressTracker::println("[ready] waiting for ready");
 
                 let ready_line = ProgressTracker::leaf(
                     "waiting for ready".to_string(),
                     tokio::time::timeout(Duration::from_secs(60), stdout_receiver),
                 )
                 .await??;
+                ProgressTracker::println(format!("[ready] ready_line: {ready_line}").as_str());
                 if ready_line.starts_with("ready: ") {
                     *self.server_defns.try_write().unwrap() =
                         serde_json::from_str(ready_line.trim_start_matches("ready: ")).unwrap();
